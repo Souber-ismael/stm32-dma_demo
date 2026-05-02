@@ -1,9 +1,8 @@
 #include "main.h"
 #include "stm32f1xx.h"
-#include "uart.h"
 
 UART_HandleTypeDef huart1;
-DMA_HandleTypeDef  hdma_usart1_rx;
+DMA_HandleTypeDef  hdma_peritomem;
 
 /*
  * UART DMA RX — circular buffer + IDLE line detection
@@ -14,20 +13,16 @@ DMA_HandleTypeDef  hdma_usart1_rx;
  * When the RX line goes silent for one full frame the UART raises
  * the IDLE flag, which triggers UART_IDLE_Callback().
  * The callback uses NDTR (DMA down-counter) to find the write head
- * and echoes the new bytes back over TX via DMA.
+ * and echoes the new bytes back over TX.
  *
  * NDTR counts DOWN from RX_BUF_SIZE to 0.
  * write head = RX_BUF_SIZE - NDTR
- *
- * DMA channel mapping on STM32F1 (fixed in silicon):
- *   DMA1 Channel 4 → USART1 TX
- *   DMA1 Channel 5 → USART1 RX
  */
 
 #define RX_BUF_SIZE 12
 
-static uint8_t  rx_buffer[RX_BUF_SIZE];
-static uint16_t old_pos = 0;   /* read pointer — tracks last processed position */
+uint8_t         rx_buffer[RX_BUF_SIZE];
+static uint16_t old_pos   = 0;  /* read pointer — tracks last processed position */
 
 /* ----------------------------------------------------------------
  * main
@@ -38,20 +33,17 @@ int main(void)
     SystemClock_Config();
 
     MX_GPIO_Init();
-    MX_DMA_Init();           /* DMA clock must be enabled before any
-                                peripheral that uses DMA is initialised */
+    MX_DMA_Init();           /* DMA before UART: __HAL_LINKDMA must run
+                                before HAL_UART_Init() touches hdmarx   */
     MX_I2C1_Init();
     MX_USART1_UART_Init();
     MX_SPI2_Init();
 
-    /* Configure DMA1 Ch4 for USART1 TX and link it to huart1 */
-    UART_TX_Init(&huart1);
-
     /* Arm DMA reception — circular mode runs forever, no restart needed */
     if (HAL_UART_Receive_DMA(&huart1, rx_buffer, RX_BUF_SIZE) == HAL_OK) {
-        UART_TX_send_string(&huart1, "READY\r\n");
+        UART_BM_send_string("READY\r\n");
     } else {
-        UART_TX_send_string(&huart1, "ERROR\r\n");
+        UART_BM_send_string("ERROR\r\n");
     }
 
     /* HAL_UART_Receive_DMA() does not enable IDLE — enable it manually.
@@ -93,7 +85,7 @@ void USART1_IRQHandler(void)
  * UART_IDLE_Callback
  *
  * Computes how many bytes arrived since the last call using NDTR,
- * then echoes them back over TX via DMA.
+ * then echoes them back over TX.
  *
  * Three cases handled:
  *
@@ -127,15 +119,14 @@ void UART_IDLE_Callback(UART_HandleTypeDef *huart)
         {
             /* Normal or overrun: data is contiguous */
             uint16_t len = overrun ? RX_BUF_SIZE : (new_pos - old_pos);
-            UART_TX_send(&huart1, &rx_buffer[old_pos], len);
+            HAL_UART_Transmit(&huart1, &rx_buffer[old_pos], len, 100);
         }
         else
         {
-            /* Wrap-around: send tail then head.
-             * Wait between the two calls so the first DMA transfer
-             * finishes before the second one starts. */
-            UART_TX_send(&huart1, &rx_buffer[old_pos], RX_BUF_SIZE - old_pos);
-            UART_TX_send(&huart1, &rx_buffer[0], new_pos);
+            /* Wrap-around: send tail then head */
+            HAL_UART_Transmit(&huart1, &rx_buffer[old_pos],
+                              RX_BUF_SIZE - old_pos, 100);
+            HAL_UART_Transmit(&huart1, &rx_buffer[0], new_pos, 100);
         }
 
         /* Advance read pointer to the current DMA write head */
@@ -166,43 +157,41 @@ static void MX_USART1_UART_Init(void)
 }
 
 /* ----------------------------------------------------------------
- * DMA1 Init — enables the DMA1 clock and configures Channel 5
- * for USART1 RX in circular mode.
- * Channel 4 (USART1 TX) is configured separately in UART_TX_Init().
+ * DMA1 Init — Channel5 is the USART1 RX channel on STM32F1
+ *   DMA1 Ch4 → USART1 TX
+ *   DMA1 Ch5 → USART1 RX  (used here)
+ *
+ * Circular mode: NDTR reloads automatically at 0, reception
+ * never stops and no software restart is needed.
  * ---------------------------------------------------------------- */
 static void MX_DMA_Init(void)
 {
     __HAL_RCC_DMA1_CLK_ENABLE();
 
-    hdma_usart1_rx.Instance                 = DMA1_Channel5;
-    hdma_usart1_rx.Init.Direction           = DMA_PERIPH_TO_MEMORY;
-    hdma_usart1_rx.Init.PeriphInc           = DMA_PINC_DISABLE;   /* UART DR is one fixed register */
-    hdma_usart1_rx.Init.MemInc              = DMA_MINC_ENABLE;    /* advance through rx_buffer     */
-    hdma_usart1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
-    hdma_usart1_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
-    hdma_usart1_rx.Init.Mode                = DMA_CIRCULAR;       /* auto-reload, never stops      */
-    hdma_usart1_rx.Init.Priority            = DMA_PRIORITY_MEDIUM;
+    hdma_peritomem.Instance                 = DMA1_Channel5;
+    hdma_peritomem.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+    hdma_peritomem.Init.PeriphInc           = DMA_PINC_DISABLE;   /* UART DR is one fixed register */
+    hdma_peritomem.Init.MemInc              = DMA_MINC_ENABLE;    /* advance through rx_buffer     */
+    hdma_peritomem.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_peritomem.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_peritomem.Init.Mode                = DMA_CIRCULAR;
+    hdma_peritomem.Init.Priority            = DMA_PRIORITY_MEDIUM;
 
-    if (HAL_DMA_Init(&hdma_usart1_rx) != HAL_OK)
+    if (HAL_DMA_Init(&hdma_peritomem) != HAL_OK)
         Error_Handler();
 
     /* Link to UART RX path so HAL_UART_Receive_DMA() knows which channel to arm */
-    __HAL_LINKDMA(&huart1, hdmarx, hdma_usart1_rx);
+    __HAL_LINKDMA(&huart1, hdmarx, hdma_peritomem);
 
-    /* DMA IRQ needed by HAL for error handling */
+    /* DMA IRQ needed by HAL_DMA_Start_IT() for error handling */
     HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
 }
 
 /* ----------------------------------------------------------------
- * DMA IRQ Handlers
+ * DMA1 Channel5 IRQ Handler — routes to HAL for error handling
  * ---------------------------------------------------------------- */
-void DMA1_Channel4_IRQHandler(void)   /* USART1 TX */
+void DMA1_Channel5_IRQHandler(void)
 {
-    HAL_DMA_IRQHandler(huart1.hdmatx);
-}
-
-void DMA1_Channel5_IRQHandler(void)   /* USART1 RX */
-{
-    HAL_DMA_IRQHandler(&hdma_usart1_rx);
+    HAL_DMA_IRQHandler(&hdma_peritomem);
 }

@@ -1,99 +1,78 @@
 /*
  * uart.c
  *
- * Bare metal UART driver for USART1 on STM32F1.
- * Operates directly on USART1->SR and USART1->DR registers.
- *
- * DMA TX uses DMA1 Channel 4 (USART1_TX on STM32F1).
- * Call UART_DMA_Init() once before using any DMA send functions.
+ * UART TX driver for USART1 on STM32F1 — HAL DMA mode.
+ * DMA1 Channel 4 is the USART1 TX channel (fixed by hardware).
  */
 
 #include "uart.h"
 
-void UART_BM_send_byte(uint8_t data)
+/* Internal DMA handle for USART1 TX */
+static DMA_HandleTypeDef hdma_tx;
+
+/* ----------------------------------------------------------------
+ * UART_TX_Init
+ * Configure DMA1 Channel 4 for USART1 TX in normal (one-shot) mode
+ * and link it to the UART handle so HAL_UART_Transmit_DMA() can use it.
+ * ---------------------------------------------------------------- */
+void UART_TX_Init(UART_HandleTypeDef *huart)
 {
-    /* Wait until transmit data register is empty (TXE = 1) */
-    while (!(USART1->SR & USART_SR_TXE));
-    USART1->DR = data;
-}
+    hdma_tx.Instance                 = DMA1_Channel4;   /* USART1 TX — fixed by hardware */
+    hdma_tx.Init.Direction           = DMA_MEMORY_TO_PERIPH;
+    hdma_tx.Init.PeriphInc           = DMA_PINC_DISABLE;   /* UART DR is one fixed register */
+    hdma_tx.Init.MemInc              = DMA_MINC_ENABLE;    /* advance through source buffer */
+    hdma_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_tx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_tx.Init.Mode                = DMA_NORMAL;         /* one transfer per call         */
+    hdma_tx.Init.Priority            = DMA_PRIORITY_LOW;
 
-void UART_BM_send_string(const char *str)
-{
-    while (*str)
-        UART_BM_send_byte((uint8_t)*str++);
-
-    /* Wait until transmission is fully complete (TC = 1)
-     * before returning — prevents data loss on back-to-back calls */
-    while (!(USART1->SR & USART_SR_TC));
-}
-
-void UART_BM_send_int(int value)
-{
-    char buffer[10];
-    int  i = 0;
-
-    if (value == 0)
-    {
-        UART_BM_send_byte('0');
+    if (HAL_DMA_Init(&hdma_tx) != HAL_OK)
         return;
-    }
 
-    if (value < 0)
-    {
-        UART_BM_send_byte('-');
-        value = -value;
-    }
+    /* Link TX DMA handle to the UART so HAL_UART_Transmit_DMA() finds it */
+    __HAL_LINKDMA(huart, hdmatx, hdma_tx);
 
-    /* Build digits in reverse order */
-    while (value > 0)
-    {
-        buffer[i++] = (char)((value % 10) + '0');
-        value /= 10;
-    }
-
-    /* Send digits in correct order */
-    while (i--)
-        UART_BM_send_byte((uint8_t)buffer[i]);
+    /* Enable DMA IRQ — HAL needs it to clear flags and signal completion */
+    HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
 }
 
-/*
- * Helper — sends a 2-digit fractional part with leading zero if needed.
- * Example: 5 → "05", 36 → "36"
- */
-static void send_frac(int frac)
+/* ----------------------------------------------------------------
+ * UART_TX_busy
+ * Returns 1 while a transfer is running, 0 when the channel is free.
+ * ---------------------------------------------------------------- */
+uint8_t UART_TX_busy(UART_HandleTypeDef *huart)
 {
-    if (frac < 10)
-        UART_BM_send_byte('0');
-    UART_BM_send_int(frac);
+    return (HAL_UART_GetState(huart) & HAL_UART_STATE_BUSY_TX) != 0;
 }
 
-void UART_BM_send_aht20(int t_int, int t_frac, int h_int, int h_frac)
+/* ----------------------------------------------------------------
+ * UART_TX_send
+ * Start a non-blocking DMA transfer.
+ * The caller is responsible for keeping `buf` valid until the
+ * transfer completes (UART_TX_busy() returns 0).
+ * ---------------------------------------------------------------- */
+void UART_TX_send(UART_HandleTypeDef *huart, const uint8_t *buf, uint16_t len)
 {
-    UART_BM_send_string("AHT | Temp: ");
-    UART_BM_send_int(t_int);
-    UART_BM_send_byte('.');
-    send_frac(t_frac);
-
-    UART_BM_send_string(" C | Hum: ");
-    UART_BM_send_int(h_int);
-    UART_BM_send_byte('.');
-    send_frac(h_frac);
-
-    UART_BM_send_string(" %\r\n");
+    /* Wait for any previous transfer to finish before starting a new one */
+    while (UART_TX_busy(huart));
+    HAL_UART_Transmit_DMA(huart, (uint8_t *)buf, len);
 }
 
-void UART_BM_send_bmp280(int t_int, int t_frac, int p_int, int p_frac)
+/* ----------------------------------------------------------------
+ * UART_TX_send_string
+ * Copy the string into a static buffer then start a DMA transfer.
+ * The static buffer stays valid for the duration of the transfer.
+ * Max string length: 128 bytes (including null terminator).
+ * ---------------------------------------------------------------- */
+void UART_TX_send_string(UART_HandleTypeDef *huart, const char *str)
 {
-    UART_BM_send_string("BMP | Temp: ");
-    UART_BM_send_int(t_int);
-    UART_BM_send_byte('.');
-    send_frac(t_frac);
+    static uint8_t tx_buf[128];
+    uint16_t len = (uint16_t)strlen(str);
 
-    UART_BM_send_string(" C | Press: ");
-    UART_BM_send_int(p_int);
-    UART_BM_send_byte('.');
-    send_frac(p_frac);
+    if (len == 0 || len >= sizeof(tx_buf))
+        return;
 
-    UART_BM_send_string(" hPa\r\n");
+    memcpy(tx_buf, str, len);
+    UART_TX_send(huart, tx_buf, len);
 }
-
