@@ -6,18 +6,16 @@ UART_HandleTypeDef huart1;
 DMA_HandleTypeDef  hdma_usart1_rx;
 
 /*
- * UART DMA RX — circular buffer + IDLE line detection
+ * UART DMA RX — normal (one-shot) mode
  * STM32F1 — USART1 RX → DMA1 Channel5 → rx_buffer
  *
- * The DMA writes every incoming byte into rx_buffer in circular
- * mode and wraps back to index 0 automatically.
- * When the RX line goes silent for one full frame the UART raises
- * the IDLE flag, which triggers UART_IDLE_Callback().
- * The callback uses NDTR (DMA down-counter) to find the write head
- * and echoes the new bytes back over TX via DMA.
+ * The DMA transfers exactly RX_BUF_SIZE bytes then stops.
+ * HAL_UART_RxCpltCallback() fires when the transfer is complete
+ * and immediately re-arms the DMA for the next packet.
  *
- * NDTR counts DOWN from RX_BUF_SIZE to 0.
- * write head = RX_BUF_SIZE - NDTR
+ * Use this mode when every packet has a fixed, known length.
+ * For variable-length packets use the circular + IDLE project
+ * (UART_DMA_CIR) instead.
  *
  * DMA channel mapping on STM32F1 (fixed in silicon):
  *   DMA1 Channel 4 → USART1 TX
@@ -26,8 +24,7 @@ DMA_HandleTypeDef  hdma_usart1_rx;
 
 #define RX_BUF_SIZE 12
 
-static uint8_t  rx_buffer[RX_BUF_SIZE];
-static uint16_t old_pos = 0;   /* read pointer — tracks last processed position */
+static uint8_t rx_buffer[RX_BUF_SIZE];
 
 /* ----------------------------------------------------------------
  * main
@@ -44,108 +41,52 @@ int main(void)
     MX_USART1_UART_Init();
     MX_SPI2_Init();
 
-    /* Configure DMA1 Ch4 for USART1 TX and link it to huart1 */
     UART_TX_Init(&huart1);
 
-    /* Arm DMA reception — circular mode runs forever, no restart needed */
-    if (HAL_UART_Receive_DMA(&huart1, rx_buffer, RX_BUF_SIZE) == HAL_OK) {
-        UART_TX_send_string(&huart1, "READY\r\n");
-    } else {
-        UART_TX_send_string(&huart1, "ERROR\r\n");
-    }
+    /* Arm the first reception — the callback re-arms it automatically */
+    HAL_UART_Receive_DMA(&huart1, rx_buffer, RX_BUF_SIZE);
 
-    /* HAL_UART_Receive_DMA() does not enable IDLE — enable it manually.
-     * The flag fires when the line stays high for one full frame after
-     * the last received byte, signalling end of packet. */
-    __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+    UART_TX_send_string(&huart1, "READY\r\n");
 
     while (1)
     {
-        /* All RX processing happens inside UART_IDLE_Callback().
+        /* All RX processing happens inside HAL_UART_RxCpltCallback().
          * The CPU is free here for application logic. */
     }
 }
 
 /* ----------------------------------------------------------------
- * USART1 IRQ Handler
+ * HAL_UART_RxCpltCallback
  *
- * HAL_UART_IRQHandler() clears RXNE, TC, and error flags.
- * IDLE is not handled by HAL so we check it manually after.
- * Calling HAL first avoids a race with an in-progress byte.
+ * Called by HAL when the DMA has transferred exactly RX_BUF_SIZE
+ * bytes into rx_buffer.  Process the data, then re-arm the DMA
+ * so the next packet can be received.
+ * ---------------------------------------------------------------- */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != USART1)
+        return;
+
+    /* Echo the received packet back over TX */
+    UART_TX_send(&huart1, rx_buffer, RX_BUF_SIZE);
+
+    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  /* heartbeat LED */
+
+    /* Re-arm DMA for the next fixed-size packet */
+    HAL_UART_Receive_DMA(&huart1, rx_buffer, RX_BUF_SIZE);
+}
+
+/* ----------------------------------------------------------------
+ * USART1 IRQ Handler — delegates entirely to HAL.
+ * HAL_UART_RxCpltCallback() is called from here when TC fires.
  * ---------------------------------------------------------------- */
 void USART1_IRQHandler(void)
 {
     HAL_UART_IRQHandler(&huart1);
-
-    if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_IDLE))
-    {
-        /* On STM32F1 clearing IDLE requires reading SR then DR.
-         * __HAL_UART_CLEAR_IDLEFLAG() performs that sequence. */
-        __HAL_UART_CLEAR_IDLEFLAG(&huart1);
-
-        UART_IDLE_Callback(&huart1);
-
-        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  /* heartbeat LED */
-    }
-}
-
-/* ----------------------------------------------------------------
- * UART_IDLE_Callback
- *
- * Computes how many bytes arrived since the last call using NDTR,
- * then echoes them back over TX via DMA.
- *
- * Three cases handled:
- *
- *   Normal  (new_pos > old_pos):
- *     [....old####new....]  → send old..new-1
- *
- *   Wrap    (new_pos < old_pos):
- *     [####new....old####] → send old..end, then 0..new-1
- *
- *   Overrun (new_pos == old_pos but DMA moved):
- *     Sender filled the entire buffer before IDLE fired.
- *     Detected by comparing NDTR against its previous value.
- *     → send all RX_BUF_SIZE bytes starting from old_pos.
- * ---------------------------------------------------------------- */
-void UART_IDLE_Callback(UART_HandleTypeDef *huart)
-{
-    (void)huart;
-
-    uint16_t ndtr    = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
-    uint16_t new_pos = RX_BUF_SIZE - ndtr;
-
-    /* Track previous NDTR to detect the overrun case where
-     * new_pos and old_pos coincide after a full-buffer write. */
-    static uint16_t prev_ndtr = 0;
-    uint8_t overrun = (new_pos == old_pos) && (ndtr != prev_ndtr);
-    prev_ndtr = ndtr;
-
-    if (new_pos != old_pos || overrun)
-    {
-        if (overrun || new_pos > old_pos)
-        {
-            /* Normal or overrun: data is contiguous */
-            uint16_t len = overrun ? RX_BUF_SIZE : (new_pos - old_pos);
-            UART_TX_send(&huart1, &rx_buffer[old_pos], len);
-        }
-        else
-        {
-            /* Wrap-around: send tail then head.
-             * Wait between the two calls so the first DMA transfer
-             * finishes before the second one starts. */
-            UART_TX_send(&huart1, &rx_buffer[old_pos], RX_BUF_SIZE - old_pos);
-            UART_TX_send(&huart1, &rx_buffer[0], new_pos);
-        }
-
-        /* Advance read pointer to the current DMA write head */
-        old_pos = new_pos;
-    }
 }
 
 /* ----------------------------------------------------------------
  * USART1 Init — 9600 8N1, TX+RX, no flow control
- * NVIC enabled after HAL_UART_Init() so the IRQ is armed last.
  * ---------------------------------------------------------------- */
 static void MX_USART1_UART_Init(void)
 {
@@ -166,9 +107,11 @@ static void MX_USART1_UART_Init(void)
 }
 
 /* ----------------------------------------------------------------
- * DMA1 Init — enables the DMA1 clock and configures Channel 5
- * for USART1 RX in circular mode.
- * Channel 4 (USART1 TX) is configured separately in UART_TX_Init().
+ * DMA1 Init — Channel 5 for USART1 RX in normal (one-shot) mode.
+ * The DMA stops after RX_BUF_SIZE bytes and raises TC interrupt.
+ * HAL_UART_RxCpltCallback() must call HAL_UART_Receive_DMA()
+ * again to receive the next packet.
+ * Channel 4 (USART1 TX) is configured in UART_TX_Init().
  * ---------------------------------------------------------------- */
 static void MX_DMA_Init(void)
 {
@@ -180,16 +123,14 @@ static void MX_DMA_Init(void)
     hdma_usart1_rx.Init.MemInc              = DMA_MINC_ENABLE;    /* advance through rx_buffer     */
     hdma_usart1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
     hdma_usart1_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
-    hdma_usart1_rx.Init.Mode                = DMA_CIRCULAR;       /* auto-reload, never stops      */
+    hdma_usart1_rx.Init.Mode                = DMA_NORMAL;         /* stops after RX_BUF_SIZE bytes */
     hdma_usart1_rx.Init.Priority            = DMA_PRIORITY_MEDIUM;
 
     if (HAL_DMA_Init(&hdma_usart1_rx) != HAL_OK)
         Error_Handler();
 
-    /* Link to UART RX path so HAL_UART_Receive_DMA() knows which channel to arm */
     __HAL_LINKDMA(&huart1, hdmarx, hdma_usart1_rx);
 
-    /* DMA IRQ needed by HAL for error handling */
     HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
 }
