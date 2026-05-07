@@ -40,11 +40,6 @@ It highlights an important detail about how the **Direct Memory Access** callbac
 Core/
  ├── Src/
  │    ├── main.c
- │    ├── dma.c
- │
- ├── Inc/
- │    ├── main.h
- │    ├── dma.h
 ```
 
 ---
