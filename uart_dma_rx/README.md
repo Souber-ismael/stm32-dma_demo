@@ -1,91 +1,138 @@
-🚀 STM32 UART Communication using DMA (TX + RX)
-A bare-metal UART driver for STM32F1 built around DMA and IDLE line detection. Receives variable-length ASCII commands from a host PC and echoes them back — no RTOS, no blocking calls.
+# STM32F1 — UART DMA TX + Circular RX with IDLE Detection
 
-✨ Overview
-This project implements a full-duplex UART communication driver on STM32F103 using DMA for both transmission and reception. The goal is to handle incoming commands of variable size efficiently, without polling or blocking the CPU.
+A bare-metal HAL driver for **USART1** on the STM32F103RB (Nucleo-64) that demonstrates:
 
-🎯 Features
+- **Non-blocking DMA TX** — strings are sent via DMA while the CPU continues
+- **Circular DMA RX** — the DMA fills a ring buffer continuously without software restart
+- **IDLE line detection** — the UART IDLE interrupt signals end-of-frame for variable-length packets
+- **Line echo** — every received line is echoed back over TX
 
-DMA-based TX — non-blocking transmission with completion flag
-DMA-based RX — continuous reception into a circular buffer
-IDLE line detection — triggers on end of message regardless of length
-\r\n parsing — extracts clean command strings automatically
-No RTOS required — runs entirely in a while(1) loop
-Safe TX/RX synchronization — prevents handle conflicts on shared gState
+---
 
+## Hardware
 
-🧱 Project Structure
-Core/
-├── Inc/
-│   └── uart.h        — TX driver declarations and extern flags
-├── Src/
-│   ├── main.c        — init, IDLE enable, main loop with RX processing
-│   └── uart.c        — DMA TX driver, TxCplt callback, IRQ handler
+| Signal | Pin | Notes |
+|--------|-----|-------|
+| USART1 TX | PA9 | AF push-pull |
+| USART1 RX | PA10 | Input floating |
+| LED (LD2) | PA5 | Toggles on activity |
+| User button (B1) | PC13 | EXTI, not used in this demo |
 
-⚙️ System Architecture
-[PC Terminal]
-     │  SOUBER\r\n
-     ▼
-[USART1 RX pin]
-     │
-     ▼
-[Shift Register]  ←  receives bits one by one, assembles one byte
-     │
-     ▼
-[RDR Register]    ←  holds exactly 1 byte at a time
-     │
-     ▼
-[DMA Channel 5]   ←  transfers byte into RAM without CPU
-     │
-     ▼
-[rx_buffer[64]]   ←  your data sits here
-     │
-     ▼
-[IDLE Interrupt]  ←  fires when line goes silent after last byte
-     │
-     ▼
-[while(1) parses] ←  extracts command, sends response via DMA TX
+---
 
-📥 Reception Strategy
-Reception is handled with DMA normal mode combined with the UART IDLE interrupt.
-The DMA is configured for a 64-byte buffer. It runs continuously and writes incoming bytes into rx_buffer. When the sender stops transmitting, the UART line goes idle and triggers the IDLE interrupt — regardless of how many bytes were actually received.
-Inside the interrupt, a volatile flag dma is set to 1. The main loop checks this flag, parses the buffer line by line looking for \n, strips the trailing \r, null-terminates the string, and processes the command.
-After processing, HAL_UART_DMAStop() is called to reset RxState to READY, then HAL_UART_Receive_DMA() restarts the reception from the beginning of the buffer.
+## DMA Channel Mapping (STM32F1 — fixed in silicon)
 
-📤 Transmission Strategy
-Transmission uses HAL_UART_Transmit_DMA() with a static internal buffer in uart.c. Before every send, the driver waits for the tx_done flag to be 1 — meaning the previous transfer has fully completed as confirmed by TxCpltCallback. The data is copied into the static buffer, tx_done is cleared, and the DMA transfer starts.
-This guarantees the buffer is never overwritten mid-transfer and prevents the TX DMA from conflicting with the RX restart.
+| Channel | Direction | Used for |
+|---------|-----------|----------|
+| DMA1 Channel 4 | Memory → Peripheral | USART1 TX |
+| DMA1 Channel 5 | Peripheral → Memory | USART1 RX (circular) |
 
-🧠 Key Concepts
-DMA normal mode — transfers exactly N bytes then stops. RxState stays BUSY_RX until all N bytes are received or the transfer is manually stopped.
-IDLE interrupt — fires when the UART line stays silent for one full frame after the last received byte. It is independent from the DMA — the DMA does not know the message is complete, it just keeps waiting for the remaining bytes.
-RxState vs gState — the HAL handle has two state fields. gState covers the global peripheral state and is shared by TX and RX. RxState covers only the receive path. HAL_UART_Receive_DMA() checks both before accepting a new transfer.
-tx_done flag — a volatile uint8_t set to 1 in HAL_UART_TxCpltCallback(). It must be volatile so the compiler always reads its actual value from memory and does not optimize the while(!tx_done) loop away.
+---
 
-🐞 Debug Notes
-HAL_UART_Receive_DMA() returns 2 (HAL_BUSY) — RxState is still BUSY_RX because the DMA never received its full N bytes. Call HAL_UART_DMAStop() first to force RxState back to READY.
-received counter keeps growing (8, 16, 22, 28...) — the DMA restart is failing silently. The DMA is accumulating all messages into the same buffer starting from where it left off. Root cause is always HAL_BUSY on the restart call.
-TX and RX conflict on gState — TX DMA sets gState = BUSY_TX and returns immediately. If RX is restarted before TxCpltCallback fires, HAL refuses with HAL_BUSY. Always wait for tx_done = 1 before restarting RX.
-line_pos corruption across callbacks — line_pos is a global variable. If a buffer ends without a \n, the leftover bytes stay in line_buffer and get prepended to the next message. Always break the for loop immediately after processing \n.
-Overrun Error (ORE) — the RDR holds only one byte. If a new byte arrives before the DMA reads the current one, ORE is set and the UART freezes. Handle it in HAL_UART_ErrorCallback() by clearing the flag and restarting the DMA.
+## How It Works
 
-⚠️ Important Notes
+```
+Startup
+  HAL_Init → SystemClock → GPIO → DMA → UART → UART_TX_Init → UART_Driver_Init
+  → send "READY\r\n" via DMA TX
 
-dma and tx_done must both be declared volatile or the compiler may optimize away the polling loops
-MX_USART1_UART_Init() must be called before UART_TX_Init() — otherwise HAL_UART_Init() overwrites the DMA TX link
-DMA IRQ priority should be equal to or higher than UART IRQ priority to avoid the IDLE interrupt preempting an ongoing DMA transfer
-IDLE and DMA are fully independent — IDLE firing does not stop or reset the DMA in any way
-TX and RX share gState in the HAL handle even though they are physically independent on the hardware
+RX path (interrupt-driven)
+  Byte arrives → DMA writes to rx_buffer (circular, never stops)
+  Line goes idle → UART IDLE flag fires → USART1_IRQHandler
+    → UART_IDLE_Callback sets rx_ready = 1
 
+Main loop
+  UART_RX_Process() polls rx_ready
+    → reconstructs line from rx_buffer
+    → echoes line back via UART_TX_send_string()
+    → re-arms DMA RX
+```
 
-🚀 Possible Improvements
+### IDLE Detection
 
-Replace the while(!tx_done) busy-wait with a proper state machine to make the main loop fully non-blocking
-Add a command dispatch table in main.c instead of chained strcmp calls
-Move RX parsing into a dedicated uart_rx.c with its own ring buffer for multi-message queuing
-Add timeout detection to flush a partial line_buffer if no \n arrives within a defined window
-Migrate to HAL_UARTEx_ReceiveToIdle_DMA() for a cleaner IDLE-based reception without manual IRQ handling
+`HAL_UART_Receive_DMA()` does not enable the IDLE interrupt. It is enabled manually after arming the DMA:
 
+```c
+__HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+```
 
-📝 Conclusion
-This project started as a simple UART echo and turned into a deep dive into how HAL manages DMA state internally. The main lesson is that IDLE and DMA are independent subsystems — IDLE tells you the message is done, but DMA does not know that and keeps its RxState as BUSY_RX. Understanding gState, RxState, HAL_BUSY, and the TX/RX handle conflict is what makes the difference between a driver that works and one that breaks after the second message.
+On STM32F1, clearing the IDLE flag requires reading SR then DR in sequence. `__HAL_UART_CLEAR_IDLEFLAG()` performs this correctly.
+
+### TX Flow
+
+Each send call waits for the previous DMA transfer to finish before writing to the static buffer:
+
+```
+UART_TX_send_string()
+  while (!tx_done)        ← wait for previous DMA to finish
+  tx_done = 0
+  memcpy(tx_buf, str)     ← safe to overwrite now
+  HAL_UART_Transmit_DMA() ← start new transfer
+
+DMA1_Channel4_IRQHandler → HAL_UART_TxCpltCallback → tx_done = 1
+```
+
+---
+
+## Interrupt Priority Table
+
+| Interrupt | Priority | Role |
+|-----------|----------|------|
+| `USART1_IRQn` | 0 | IDLE detection + HAL UART handler |
+| `DMA1_Channel4_IRQn` | 1 | TX complete → sets `tx_done` |
+| `DMA1_Channel5_IRQn` | 1 | RX DMA error handling |
+| `EXTI15_10_IRQn` | 5 | User button (lowest) |
+
+---
+
+## Initialization Order
+
+Order matters — the DMA clock must be enabled and channels configured before `HAL_UART_Init()` links the handles:
+
+```c
+MX_GPIO_Init();
+MX_DMA_Init();           // DMA1 clock + Channel5 RX config
+MX_USART1_UART_Init();   // USART1 + NVIC
+UART_TX_Init(&huart1);   // Channel4 TX config + link hdmatx
+UART_Driver_Init(&huart1); // arm RX DMA + enable IDLE
+```
+
+---
+
+## Project Structure
+
+```
+simple/
+├── Core/
+│   ├── Inc/
+│   │   ├── main.h       — board pin defines (LD2, B1, USART pins)
+│   │   └── uart.h       — driver API and buffer size defines
+│   └── Src/
+│       ├── main.c       — init, IRQ handlers, while(1) loop
+│       ├── uart.c       — DMA TX/RX driver implementation
+│       ├── stm32f1xx_hal_msp.c  — GPIO/clock config for USART1
+│       └── stm32f1xx_it.c       — core exception handlers
+├── Drivers/             — STM32F1xx HAL (generated by CubeMX)
+└── README.md
+```
+
+---
+
+## Build & Flash
+
+Developed with **STM32CubeIDE 1.19**. Open the workspace, select the `simple` project, and click **Run**.
+
+Serial terminal settings: **9600 baud, 8N1, no flow control**.
+
+---
+
+## Key Concepts Demonstrated
+
+| Concept | Where |
+|---------|-------|
+| `__HAL_LINKDMA()` — linking DMA handle to UART | `uart.c` → `UART_TX_Init()` |
+| Circular DMA mode — no software restart | `main.c` → `MX_DMA_Init()` |
+| IDLE interrupt — manual enable after `Receive_DMA` | `uart.c` → `UART_Driver_Init()` |
+| Static TX buffer — safe for DMA lifetime | `uart.c` → `UART_TX_send_string()` |
+| `tx_done` flag — prevents buffer overwrite | `uart.c` → `HAL_UART_TxCpltCallback()` |
+| IDLE clear sequence (SR then DR) on STM32F1 | `main.c` → `USART1_IRQHandler()` |
