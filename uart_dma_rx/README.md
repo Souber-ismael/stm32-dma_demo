@@ -1,6 +1,6 @@
 # STM32F1 — UART DMA TX + Circular RX with IDLE Detection
 
-A bare-metal HAL driver for **USART1** on the STM32F103RB (Nucleo-64) that demonstrates:
+A HAL-based UART driver for STM32F1 built around DMA and IDLE line detection:
 
 - **Non-blocking DMA TX** — strings are sent via DMA while the CPU continues
 - **Circular DMA RX** — the DMA fills a ring buffer continuously without software restart
