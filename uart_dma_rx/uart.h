@@ -1,53 +1,85 @@
 /*
  * uart.h
  *
- * UART TX driver for USART1 on STM32F1 — HAL DMA mode.
- * All send functions are non-blocking: the DMA transfers the data
- * while the CPU continues.  The caller must ensure the buffer stays
- * valid until the transfer completes (check UART_TX_busy()).
+ * Driver UART complet pour USART1 sur STM32F1 — mode DMA HAL.
  *
- * DMA channel mapping on STM32F1 (fixed in silicon):
- *   DMA1 Channel 4 → USART1 TX   (used here)
- *   DMA1 Channel 5 → USART1 RX
+ * TX : DMA1 Channel4 → USART1 TX  (mapping fixe hardware)
+ * RX : DMA1 Channel5 → USART1 RX  (mapping fixe hardware)
+ *      Mode circulaire + détection IDLE pour paquets de longueur variable.
+ *
+ * Séquence d'initialisation dans main() :
+ *   1. MX_DMA_Init()          — horloge DMA + config Channel5 RX
+ *   2. MX_USART1_UART_Init()  — config USART1
+ *   3. UART_TX_Init()         — config Channel4 TX + lien hdmatx
+ *   4. UART_Driver_Init()     — arme le DMA RX + active l'IRQ IDLE
  */
 
-#ifndef UART_H
-#define UART_H
+#ifndef INC_UART_H_
+#define INC_UART_H_
 
 #include "stm32f1xx_hal.h"
 #include <stdint.h>
 #include <string.h>
 
+/* Taille du buffer circulaire RX — doit être >= la plus grande trame attendue */
+#define UART_RX_BUF_SIZE  64
+
+/* Taille du buffer statique TX utilisé par UART_TX_send_string() */
+#define UART_TX_BUF_SIZE  128
+
 /*
  * UART_TX_Init
- * Configure DMA1 Channel 4 for USART1 TX and link it to huart1.
- * Must be called once, after HAL_UART_Init() and after
- * __HAL_RCC_DMA1_CLK_ENABLE().
+ * Configure DMA1 Channel4 pour USART1 TX en mode normal (one-shot).
+ * Lie le handle DMA au handle UART via __HAL_LINKDMA.
+ * À appeler après MX_DMA_Init() et MX_USART1_UART_Init().
  */
 void UART_TX_Init(UART_HandleTypeDef *huart);
 
 /*
- * UART_TX_busy
- * Returns 1 while a DMA TX transfer is in progress, 0 when idle.
- * Use this before starting a new transfer if the buffer may still
- * be in use.
+ * UART_Driver_Init
+ * Arme le DMA RX en mode circulaire et active l'interruption IDLE.
+ * À appeler après UART_TX_Init().
  */
-uint8_t UART_TX_busy(UART_HandleTypeDef *huart);
+void UART_Driver_Init(UART_HandleTypeDef *huart);
 
 /*
  * UART_TX_send
- * Start a non-blocking DMA transfer of `len` bytes from `buf`.
- * `buf` must remain valid until UART_TX_busy() returns 0.
+ * Envoie `len` octets depuis `buf` via DMA.
+ * Attend la fin du transfert précédent avant de démarrer.
+ * `buf` doit rester valide jusqu'à ce que HAL_UART_TxCpltCallback soit appelé.
  */
 void UART_TX_send(UART_HandleTypeDef *huart, const uint8_t *buf, uint16_t len);
 
 /*
  * UART_TX_send_string
- * Send a null-terminated string via DMA.
- * Uses an internal static buffer — safe for string literals and
- * short messages.  Not re-entrant: wait for UART_TX_busy() == 0
- * before calling again.
+ * Copie la chaîne dans un buffer statique interne puis envoie via DMA.
+ * L'attente avant memcpy garantit que le buffer n'est plus utilisé par le DMA.
+ * Longueur max : UART_TX_BUF_SIZE - 1 caractères.
  */
 void UART_TX_send_string(UART_HandleTypeDef *huart, const char *str);
 
-#endif /* UART_H */
+/*
+ * UART_RX_Process
+ * À appeler dans la boucle while(1) de main().
+ * Traite le contenu de rx_buffer quand rx_ready == 1 (positionné par IDLE).
+ * Reconstruit les lignes caractère par caractère, les echo sur TX,
+ * puis réarme le DMA RX.
+ */
+void UART_RX_Process(void);
+
+/*
+ * UART_IDLE_Callback
+ * Appelée depuis USART1_IRQHandler quand le flag IDLE est détecté.
+ * Positionne rx_ready = 1 pour signaler à UART_RX_Process() qu'une
+ * trame est disponible dans rx_buffer.
+ */
+void UART_IDLE_Callback(UART_HandleTypeDef *huart);
+
+/*
+ * HAL_UART_TxCpltCallback
+ * Callback HAL appelé à la fin de chaque transfert DMA TX.
+ * Remet tx_done = 1 pour débloquer le prochain envoi.
+ */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);
+
+#endif /* INC_UART_H_ */
