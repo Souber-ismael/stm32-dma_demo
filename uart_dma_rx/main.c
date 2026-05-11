@@ -126,8 +126,8 @@ static void MX_USART1_UART_Init(void)
  * en mode circulaire.
  * Channel4 (TX) est configuré séparément dans UART_TX_Init().
  *
- * Mode circulaire : NDTR se recharge automatiquement à 0,
- * la réception ne s'arrête jamais sans intervention logicielle.
+ * Mode Normal : NDTR ne se recharge pas automatiquement à 0,
+ * la réception  s'arrête.
  * ---------------------------------------------------------------- */
 static void MX_DMA_Init(void)
 {
@@ -139,7 +139,7 @@ static void MX_DMA_Init(void)
     hdma_usart1_rx.Init.MemInc              = DMA_MINC_ENABLE;    /* avance dans rx_buffer   */
     hdma_usart1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
     hdma_usart1_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
-    hdma_usart1_rx.Init.Mode                = DMA_CIRCULAR;       /* jamais arrêté           */
+    hdma_usart1_rx.Init.Mode                = DMA_NORMAL;    
     hdma_usart1_rx.Init.Priority            = DMA_PRIORITY_MEDIUM;
 
     if (HAL_DMA_Init(&hdma_usart1_rx) != HAL_OK)
